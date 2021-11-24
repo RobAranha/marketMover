@@ -1,0 +1,240 @@
+---
+title: "marketMover"
+subtitle: "Prediction of Up/Down Movements in the S&P500 (Boosted Decision Trees)"
+author: "Robert Aranha"
+date: "August 2021"
+output: 
+  html_document:
+    toc: True
+    toc_float: True
+    theme: cosmo
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Load Libraries
+
+```{r load libraries}
+library(tidyverse)
+library(tidymodels)
+library(ISLR)
+library(knitr)
+library(GGally)
+library(doParallel)
+library(glmnet)
+library(reshape2)
+library(kableExtra)
+library(xgboost)
+library(ranger)
+library(kernlab)
+library(rlist)
+```
+
+## Load Data
+
+```{r load data}
+# Documentation for data available here:
+# https://www.rdocumentation.org/packages/ISLR/versions/1.2/topics/Smarket
+data(Smarket)
+market_dt <- Smarket %>%
+  as_tibble() %>%
+  select(-Today) %>%
+  mutate(Direction = fct_relevel(Direction, 'Up'))
+
+market_dt <- market_dt %>%
+  mutate(cc_Lag1 = log(1 + Lag1/100),
+         cc_avg = cummean(cc_Lag1),
+         cc_over_avg = cc_Lag1 > cc_avg,
+         cc_avg_diff = cc_Lag1 - cc_avg)
+ 
+vals <- list()
+ 
+for (row in 2:nrow(market_dt)) {
+  cur_cc_over_avg <- market_dt[row, "cc_over_avg"]
+  prev_cc_over_avg <- market_dt[row - 1, "cc_over_avg"]
+  
+  if (row == 2){
+   if (prev_cc_over_avg == TRUE) {
+     vals <- list.append(1)
+   } else if (prev_cc_over_avg == FALSE) {
+     vals <- list.append(-1)
+   }
+  }
+  
+  if(cur_cc_over_avg == TRUE && prev_cc_over_avg == TRUE){
+   vals <- list.append(vals, 1 + vals[row - 1])
+  } else if (cur_cc_over_avg == TRUE && prev_cc_over_avg == FALSE){
+   vals <- list.append(vals, 1)   
+  } else if (cur_cc_over_avg == FALSE && prev_cc_over_avg == TRUE){
+   vals <- list.append(vals, -1)   
+  } else if (cur_cc_over_avg == FALSE && prev_cc_over_avg == FALSE){
+   vals <- list.append(vals, vals[row - 1] - 1)   
+  }
+}
+
+market_dt$days_over_avg = vals
+```
+
+## Split Data
+
+```{r split_data}
+set.seed(123)
+market_split <- initial_split(market_dt, prop=0.7, strata=Direction)
+train_dt <- training(market_split)
+test_dt <- testing(market_split)
+
+set.seed(456)
+folds_dt <- train_dt %>%
+  vfold_cv(v=5, repeats=5, strata=Direction)
+```
+
+## Define Performance Metrics
+
+```{r build_metric_set}
+perf_meas <- metric_set(roc_auc, precision, recall, accuracy, f_meas, kap)
+```
+
+### Recipe
+
+We now define the recipe for our boosted decision tree. We will attempt to predict direction based on Volume, Year, cc_avg_diff, and days_over_avg. We will opt not to include time lags as variables in our predictions for the rational stated in the EDA section.
+
+We will apply the following transformations in our recipe:
+
++ *step_bagimpute* (creates bagged tree models to impute missing data): This step is applied as missing values will result in a loss of predictive performance in our models.
++ *step_zv* (removes of columns with single values): This step is applied as columns with single variables will add no predictive power to our models, particularly when working with decision trees.
++ *step_corr* (filters out predictors that are highly correlated):  This step is applied to reduce dependencies on background variables and reduce unneeded splits in our trees
+
+Note that the only transformation applied to out outcome variables is ``step_bagimpute``. We will not consider applying other transformations to our outcome variable as we are working with categorical data. 
+
+```{r boosting_recipe}
+boost_rec <- 
+  recipe(Direction ~ Volume + Year + cc_avg_diff + days_over_avg, data=train_dt) %>%
+  step_mutate(direction_na = ifelse(is.na(Direction), 1, 0), skip = TRUE)%>%
+  step_bagimpute(Direction, Volume) %>%
+  step_zv(all_predictors(), -all_outcomes()) %>%
+  step_corr(all_predictors(), -all_outcomes())
+```
+
+### Define the Model
+
+Our model will use the xgboost engine and will be set to classification mode. We will indicate that we want to tune trees as a hyperparameter. Note that trees refers to the number of trees contained in our ensemble method.
+
+```{r boosting_model}
+boost_mod <- 
+  boost_tree(trees = tune()) %>%
+  set_mode('classification') %>%
+  set_engine('xgboost')
+```
+
+
+## Hyperparameters
+
+We then create a grid of hyperparameters related to the number of trees in our ensemble and the number of levels to be contained in a tree.
+
+```{r tune_hyperparameters}
+boost_grid <- grid_regular(trees(c(5, 100)), levels = 10)
+```
+
+### Define Workflow
+
+We then define the workflow, adding our boosted decision tree model and our recipe.
+
+```{r boosting_workflow}
+boost_wf <- 
+  workflow() %>%
+  add_recipe(boost_rec) %>%
+  add_model(boost_mod)
+```
+
+### Tune Grid
+
+We then tune our model using our grid of hyperparameters.
+
+```{r}
+all_cores <- parallel::detectCores(logical = FALSE)
+cl <- makePSOCKcluster(all_cores)
+registerDoParallel(cl)
+```
+
+```{r boosting_tune_grid}
+tune_ctrl <- control_resamples(save_pred = TRUE)
+
+boost_res <-
+  boost_wf %>%
+  tune_grid(
+    folds_dt, 
+    grid = boost_grid,
+    metrics = perf_meas, 
+    control = tune_ctrl
+  )
+```
+
+```{r}
+stopCluster(cl)
+```
+
+## Cross-Validation Results
+
+At this point we have a series of model configurations that have been trained using our k-fold dataset. Below is a chart of our performance metrics show for each model configuration.
+
+```{r boosting_model_assessment}
+boost_res %>%
+  collect_metrics() %>%
+  ggplot(aes(x = trees, y = mean)) +
+  geom_line() +
+  geom_errorbar(
+    aes(ymin = mean - std_err,
+        ymax = mean + std_err)
+  ) +
+  facet_wrap(~.metric, scales = 'free_y', ncol = 2) +
+  theme_minimal() + 
+  labs(title = 'Boosted Trees Performance', 
+       subtitle = 'Tuning Number of Trees', 
+       x = 'N. Trees', y = 'Performance Score')
+```
+
+## Top Configuration
+
+### Selection of Best Model
+
+On the basis of roc_auc the top performing model is ``model10`` which contains 100 trees. The top performing models are shown below.
+
+```{r boost_show_best}
+boost_top <- boost_res %>%
+  show_best(metric = 'roc_auc')
+
+boost_top
+```
+
+```{r boost_select_best}
+boost_best <- 
+  boost_res %>%
+  select_best(metric = 'roc_auc')
+```
+
+A confusion matrix summarizing our top models predictive performance is shown below.
+
+```{r boost_confusion_matrix}
+boost_confusion <-
+  boost_res %>%
+  conf_mat_resampled(parameters = boost_best)
+
+boost_confusion
+```
+
+### Store Results
+
+For future reference we will store the results from this section of our analysis in an external file.
+
+```{r collect_boosting_metrics}
+boost_metrics <-
+  boost_res %>%
+  collect_metrics()
+```
+
+```{r boost_save_results}
+save(boost_wf, boost_metrics, boost_confusion, boost_best, boost_top,
+     file = '../data/boosted_trees.Rda')
+```

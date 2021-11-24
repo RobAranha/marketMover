@@ -1,0 +1,708 @@
+---
+title: "marketMover"
+subtitle: "Prediction of Up/Down Movements in the S&P500"
+author: "Robert Aranha"
+date: "August 2021"
+output: 
+  html_document:
+    toc: True
+    toc_float: True
+    theme: cosmo
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Introduction
+
+## Objective
+
+In this report, we will attempt to predict movements (up or down) in the S&P500. Our primary objective is to design a model that will achieve the highest return possible (maximize alpha) using exclusively long positions. We will view this exercise as a classification problem (predicting a simple up or down movement) without consideration for risk or the magnitude of movement in the S&P500.
+
+### Load Libraries
+```{r load libraries}
+library(tidyverse)
+library(tidymodels)
+library(ISLR)
+library(knitr)
+library(GGally)
+library(doParallel)
+library(glmnet)
+library(reshape2)
+library(kableExtra)
+library(xgboost)
+library(ranger)
+library(kernlab)
+library(rlist)
+```
+
+## Data Preparation
+
+The data used in this analysis is provided through the ISLR package [Click here to view the documentation](https://www.rdocumentation.org/packages/ISLR/versions/1.2/topics/Smarket).
+
+```{r load data}
+# Documentation for data available here:
+# https://www.rdocumentation.org/packages/ISLR/versions/1.2/topics/Smarket
+data(Smarket)
+market_dt <- Smarket %>%
+  as_tibble() %>%
+  select(-Today) %>%
+  mutate(Direction = fct_relevel(Direction, 'Up'))
+
+# Add columns for:
+#   cc_Lag1 (continuously compounded return for t-1 days),
+#   cc_avg (rolling avg of cc returns),
+#   cc_over_avg (TRUE/FALSE if CC_lag1 > cc_avg),
+#   cc_avg_diff (different between current and avg cc returns)
+market_dt_full <- market_dt %>%
+  mutate(cc_Lag1 = log(1 + Lag1/100),
+         cc_avg = cummean(cc_Lag1),
+         cc_over_avg = cc_Lag1 > cc_avg,
+         cc_avg_diff = cc_Lag1 - cc_avg)
+ 
+# Add column for number of consecutive days cc_Lag1 is above over cc_avg
+vals <- list()
+ 
+for (row in 2:nrow(market_dt_full)) {
+  cur_cc_over_avg <- market_dt_full[row, "cc_over_avg"]
+  prev_cc_over_avg <- market_dt_full[row - 1, "cc_over_avg"]
+  
+  if (row == 2){
+   if (prev_cc_over_avg == TRUE) {
+     vals <- list.append(1)
+   } else if (prev_cc_over_avg == FALSE) {
+     vals <- list.append(-1)
+   }
+  }
+  
+  if(cur_cc_over_avg == TRUE && prev_cc_over_avg == TRUE){
+   vals <- list.append(vals, 1 + vals[row - 1])
+  } else if (cur_cc_over_avg == TRUE && prev_cc_over_avg == FALSE){
+   vals <- list.append(vals, 1)   
+  } else if (cur_cc_over_avg == FALSE && prev_cc_over_avg == TRUE){
+   vals <- list.append(vals, -1)   
+  } else if (cur_cc_over_avg == FALSE && prev_cc_over_avg == FALSE){
+   vals <- list.append(vals, vals[row - 1] - 1)   
+  }
+}
+
+market_dt_full$days_over_avg = vals
+
+market_dt <- market_dt_full %>%
+  select(-cc_Lag1, -cc_avg, -cc_over_avg)
+```
+
+### Summary of Fields
+
+The data set contains 1250 observation with the following variables:
+
++ **Direction**: Describes the direction in which the S&P500 moved (Up or Down)
++ **Lag1**: Described the simple one day return achieved between t-2 and t-1 days from the time (t) the observation was made
++ **Lag2**: Described the simple one day return achieved between t-3 and t-2 days from the time (t) the observation was made
++ **Lag3**: Described the simple one day return achieved between t-4 and t-3 days from the time (t) the observation was made
++ **Lag4**: Described the simple one day return achieved between t-5 and t-4 days from the time (t) the observation was made
++ **Lag5**: Described the simple one day return achieved between t-6 and t-5 days from the time (t) the observation was made
++ **Volume**: Describes the current traded volume (in billions)
++ **Today**: Describes the percentage return for today
++ **Year**: Describes the year in which the observation occurred
+
+Note that the variable ``Today`` has been removed from our analysis as this field can be used to predict the direction with certainty (a positive return implies a positive up movement).
+
+We have also added the following variables to our data set:
+
++ **cc_avg_diff**: The current cc_return - the rolling average of cc_returns
+  - Please note that ``cc returns`` refer to ``continuously compounded returns``. The cc_return is calculated as log(1 + Lag1/100)
+  - Also note that the average is based on historic data (i.e., the average computed in 2003 does not factor in data from 2005, however it does factor in data from 2002)
++ **days_over_avg**: The number of consecutive days where the current cc_return > avg_cc_return (negative representing when cc_return < avg_cc_return)
+
+## EDA
+
+### Glimpse of Data
+
+A glimpse of the data, including the fields we have added, is shown below.
+
+```{r}
+market_dt %>%
+  mutate(index = seq.int(nrow(market_dt))) %>%
+  top_n(-5, index) %>%
+  select(-index) %>%
+  glimpse() %>%
+  kable(digits=5) %>%
+  kable_styling(full_width = F) %>%
+  add_header_above(header = c("Glimpse of Data" = 10),
+                   bold = TRUE)
+```
+
+
+### Field Summary
+
+A summary of all variables included in our analysis is shown below.
+
+```{r variable_summary}
+market_dt %>%
+  # Convert direction to integer for representation
+  mutate(
+    Direction = -1 * market_dt$Direction %>%
+      as.integer() %>%
+      -2
+  ) %>%
+  rownames_to_column('id') %>%
+  pivot_longer(-id) %>%
+  group_by(name) %>%
+  summarise(
+    count = n(),
+    min = min(value),
+    Q1 = quantile(value, 0.25),
+    median = median(value),
+    mean = mean(value),
+    Q3 = quantile(value, 0.75),
+    max = max(value),
+    SD = sd(value),
+    IQR = IQR(value),
+    NAs = sum(is.na(value))
+  ) %>%
+  rename(field = name) %>%
+  kable(digits=3) %>%
+  kable_styling(full_width = F) %>%
+  add_header_above(header = c("Summary of Variables" = 11),
+                   bold = TRUE)
+```
+From the above table we can see that the classes for Direction are fairly balanced, with slightly more observations containing up movements than down movements.
+
+### Trends and Observations
+
+We will now create a scatterplot matrix to analyze trends that are apparent in our dataset and view the distribution of our variables. Identification of these trends and distributions will assist in the development of our models and determining which transformation will be required to yield effective predictions.
+
+To identify correlation between variables and the direction of movement in the S&P500, we will temporarily add a variable ``Direction_num`` where 0 represents a down movement and 1 represents and up movement.
+
+```{r scatterplot_matrix, fig.width=16, fig.height=12}
+market_dt %>%
+  mutate(
+    Direction_num = -1 * market_dt$Direction %>%
+    as.integer() %>%
+      -2
+  , .before = Direction) %>%
+  ggpairs(
+    mapping = aes(colour=Direction),
+    legend = 1,
+    lower = list(
+      continuous = wrap("smooth_loess", color='skyblue'),
+      na = "na"
+    ),
+  upper = list(
+    continuous = wrap("cor", size=5),
+    na = "na"
+    )
+  ) +
+  theme(legend.position = "bottom")
+```
+
+In analysis of the scatter plot matrix above, the following should be highlighted with respect to the variables contained in our dataset:
+
++ **Lag1:Lag5**:
+  - *Correlation*: Time lags 3-5 have low correlations to direction. On average, correlation is higher for down movements than for up movements. Correlation is very high between Lag1 and both cc_avg_diff as well as days_over_avg which is expected as both variables were derived from Lag1.
+  - *Density*: All time lags are relatively normally distributed with observations primarily centered around 0 and distributed across [-3:3].
+  - *Scatter Plots*: Observations are fairly clustered together, and exhibit no significant relationships with each other. A low negative relationship may exist between time lags, suggesting that these returns are generated through a mean reverting process.
++ **Volume**:
+  - *Correlation*: Correlation is relatively significant with respect to direction and is highly significant with respect to each time lag. Likely this is a case where the returns. generated through each time lag is being caused fluctuations in trading volume. Volume is also positively correlated with respect to year, indicating that trading volume is increasing over time. 
+  - *Density*: Observations are primarily centered around 1.25 and the distribution has a slight right tail.
+  - *Scatter Plots*: There is a negative relationship between time lags and volume in general.
++ **cc_avg_diff**:
+  - *Correlation*: Correlation is negative with respect to direction, indicating that when the cc_return is above average, a downward movement is the most probable outcome.
+  - *Density*: Observations are fairly normally distributed.
+  - *Scatter Plots*: No significant relationships are present.
++ **days_over_avg**:
+  - *Correlation*: Correlation is positive with respect cc_avg_diff. There is also negative correlation with respect to direction_num.
+  - *Density*: Observations are fairly normally distributed.
+  - *Scatter Plots*: No significant relationships are present.
+
++ **Key Observations**:
+  - *Observation 1*: Based on the native variables in our dataset, the direction of movement is primarily driven by the returns generated at time lags 1-2, as well as the year of the observation.
+    - *Remarks*: The returns generated at time lags 1-2 are likely attributed to fluctuations in trading volume as a result of external indicators (market news) impacting investors decisions to transaction in a given security contained in the S&P500. As a result, absolute movements (up or down) in the S&P500 can likely be predicted by trading volume and year alone.
+  - *Observation 2*: The returns generated at each time lag are negatively correlated, representing that the returns likely follow a mean reverting process.
+    - *Remarks*: Since market news is viewed as a random normally distributed variable, returns are expected to be generated by a mean revering process and thereby oscillate around some horizontal fixed line representing the true mean return of the index. Accordingly, we have introduced the variable ``days_over_avg`` to measure the period of time cc returns are above average, as to assist in predicting observations where returns will invert. Additionally we introduced the variable ``cc_avg_diff`` to measure the magnitude to which the current cc return exceeds the average cc return, which will also assist in predicting observations where returns will invert.
+  - *Summary*: Likely we would be able to increase our performance by excluding time lags 1-5 from our analysis. Instead, we believe that using Volume, Year, cc_avg_diff, and days_over_avg as our predictors will allow us to achieve better results in our predictions. Our models will benefit from these predictors as volume will assist in determining absolute movements in the S&P500 (up or down), cc_avg_diff as well as days_over_avg will assist in determining the direction of the movement, and year will assist in scalling all other predictors. The stated benefits of these predictors are mostly related to tree based models, while some degree of benefit may be realized with SVM and neural net based models.
+  
+  
+### Continuously Compounded Returns
+
+The continuously compounded returns and rolling average of the continuously compounded returns are plotted below for 2001. As we can see, there is a general tendency for cc_returns to revert around the average cc_return. Accordingly, our selection of cc_avg_diff and days_over_avg will aid in our ability to determine the direction of movement in the S&P500.
+
+It should also be noted that our average cc return appears highly volatile for the first 50 trading days. This is expected as the average is computed over a small sample size (less than 50 observations). To maximize performance, we should only predict observations occurring after the first 50 trading days. However, as per the assignment guidelines, we have chosen to make predictions acrross the entire dataset. With that being said, we are confident that including these predictors will still lead to increased performance overall, despite adding noise in the first 50 obersvations.
+
+```{r}
+market_dt_full %>%
+  mutate(index = seq.int(nrow(market_dt))) %>%
+  filter(Year == 2001) %>%
+  ggplot(aes(x=index)) +
+  geom_line(aes(y = cc_Lag1), color = 'blue') + 
+  geom_line(aes(y=cc_avg), color= 'red') +
+  theme_minimal() +
+  labs(title = 'S&P500 Continuously Compounded Returns Over 2021', 
+     x = 'Index of Trading Day', y = 'CC Return')
+```
+
+### Data Splitting
+
+We will divide our data into training and testing sets based on a 70% split.
+
+Following, We will then use the k-fold cross validation technique with 5 folds and 5 repetitions to create a new training dataset. Our new training set will have less bias due to resampling procedures embedded in k-fold cross validation.
+
+As stated in our EDA section, our dataset is relatively balanced with slightly more observations containing up movements than down movements. However, we will still stratify our dataset to reduce overfitting our models.
+
+```{r split_data}
+set.seed(123)
+market_split <- initial_split(market_dt, prop=0.7, strata=Direction)
+train_dt <- training(market_split)
+test_dt <- testing(market_split)
+
+set.seed(456)
+folds_dt <- train_dt %>%
+  vfold_cv(v=5, repeats=5, strata=Direction)
+```
+
+## Assessment Method
+
+In our analysis we will prepare 4 different model types and determine which model is most suitable for our classification problem.
+
+The models we will use include:
+
++ Boosted Decision Trees
++ Random Forests
++ Support Vector Machines
++ Neural Nets
+
+### Performance Measures
+
+We will view our models performance across a variety of metrics including:
+
++ roc_auc
++ precision
++ recall
++ accuracy
++ f_meas
++ kap
+
+We will use roc_auc as our metric for optimizing our model selection and choice of hyper parameters. Optimizing on the basis of roc_auc will yield the best performance for our models as we are limited to long positions in our trading decisions. Accordingly, we want to maximize the number of true positive (profitable trading decisions) and minimize the number of false positives (unprofitable trading decisions). While false negatives should ideally be minimized, these represent 'missed opportunities' as opposed to trading decisions that negatively impact our P&L. Moreover, use of roc_auc will be beneficial as our classes are slightly unbalanced and roc_auc will not be heavily distorted by unbalanced classes, whereas metrics such as precision would be.
+
+```{r build_metric_set}
+perf_meas <- metric_set(roc_auc, precision, recall, accuracy, f_meas, kap)
+```
+
+## Findings and Final Remarks
+
+In conclusion we determine that the our boosting model with 100 trees is the most optimal model contained in this report for predicting up/down movements in the S&P500. Overall, this model has achieve an roc_auc score of ``0.548`` and ``0.556`` on training and testing sets respectively. Additionally, this model achieved accuracy scores of ``0.547`` and ``0.543`` on training and testing sets respectively. 
+
+While our boosting model is identified as our overall best model, we still recognize that the performance of our model is quite poor. We attribute the poor performance to stochastic movements in the market, which significantly limit the power of our models to make accurate predictions. For further improvements we recommend including a predictor to measure market sentiment based on various news sources, as this would greatly enhance our models performance.
+
+# Boosting
+
+## Model Description
+
+Boosting algorithms utilize a series of sub-models (of the same type), each designed to specialize in a particular region of the problem space. With boosting, the sub-models are generated iterativly with each new sub-model being designed to specialize on instances that previous sub-models preformed poorly on. Each sub-models predictions are taken into account when generating the final model predictions, with high preforming sub-models having greater influence over the final model predictions.
+
+### Preprocessing Steps
+
+We will apply the following pre-processing steps:
+
++ *step_bagimpute* (creates bagged tree models to impute missing data): This step is applied as missing values will result in a loss of predictive performance in our models.
++ *step_zv* (removes of columns with single values): This step is applied as columns with single variables will add no predictive power to our models, particularly when working with decision trees.
++ *step_corr* (filters out predictors that are highly correlated):  This step is applied to reduce dependencies on background variables and reduce unneeded splits in our trees.
+
+Note that the only transformation applied to out outcome variables is ``step_bagimpute``. We will not consider applying other transformations to our outcome variable as we are working with categorical data. 
+
+## Cross-Validation Results
+
+At this point we have a series of boosted model configurations that have been trained using our k-fold dataset. Below is a chart of our performance metrics show for each model configuration.
+
+From the chart below, we can see that there is a general tendency for performance to increase across all metrics as the number of trees increases.
+
+```{r boosting_model_assessment}
+load('./data/boosted_trees.Rda')
+
+boost_metrics %>%
+  ggplot(aes(x = trees, y = mean)) +
+  geom_line() +
+  geom_errorbar(
+    aes(ymin = mean - std_err,
+        ymax = mean + std_err)
+  ) +
+  facet_wrap(~.metric, scales = 'free_y', ncol = 2) +
+  theme_minimal() + 
+  labs(title = 'Boosting Performance', 
+       subtitle = 'Tuning Number of Trees', 
+       x = 'N. Trees', y = 'Performance Score')
+```
+
+## Top Configuration
+
+The top 5 configurations are shown below.
+
+```{r boost_show_best}
+boost_top %>%
+  kable(digits=3) %>%
+  kable_styling(full_width = F) %>%
+  add_header_above(header = c("Boosting - Top Configurations" = 7),
+                   bold = TRUE)
+```
+
+On the basis of roc_auc the top performing model is ``model10`` which contains 100 trees.
+
+```{r boost_select_best}
+boost_best
+```
+
+A confusion matrix summarizing our top models predictive performance is shown below.
+
+```{r boost_confusion_matrix}
+boost_confusion %>%
+  kable(digits=0) %>%
+  kable_styling(full_width = F) %>%
+  add_header_above(header = c("Boosting - Confusion Matrix" = 3),
+                   bold = TRUE)
+```
+
+# Random Forest
+
+## Model Description
+
+Random forests are an ensemble method which combine and average the prediction from multiple decision tree models to increase predictive accuracy. Unlike our boosting model, the trees in this ensemble method will not be created itterativly.
+
+### Preprocessing Steps
+
+We will apply the following transformations in our recipe:
+
++ *step_bagimpute* (creates bagged tree models to impute missing data): This step is applied as missing values will result in a loss of predictive performance in our models.
++ *step_zv* (removes of columns with single values): This step is applied as columns with single variables will add no predictive power to our models, particularly when working with decision trees.
++ *step_corr* (filters out predictors that are highly correlated):  This step is applied to reduce dependencies on background variables and reduce unneeded splits in our trees.
+
+Note that the only transformation applied to out outcome variables is ``step_bagimpute``. We will not consider applying other transformations to our outcome variable as we are working with categorical data. 
+
+## Cross-Validation Results
+
+At this point we have a series of random forest model configurations that have been trained using our k-fold dataset. Below is a chart of our performance metrics show for each model configuration.
+
+From the chart below, we can see that performance across all metrics increases as the number of trees approach ~40. Following ~40 trees, performance begins varying and in general begins to decline. This is likely an indication that using ~40 trees will reduced generalization error/variance to almost 0.
+
+```{r rf_model_assessment}
+load('./data/forest.Rda')
+
+rf_metrics %>%
+  ggplot(aes(x = trees, y = mean)) +
+  geom_line() +
+  geom_errorbar(
+    aes(ymin = mean - std_err,
+        ymax = mean + std_err)
+  ) +
+  facet_wrap(~.metric, scales = 'free_y', ncol = 2) +
+  theme_minimal() + 
+  labs(title = 'Random Forest Performance', 
+       subtitle = 'Tuning Trees and Number of Sample Features', 
+       x = 'N Sampled Attributes', y = 'Performance Score')
+```
+
+## Top Configurations
+
+The top 5 configurations are shown below.
+
+```{r rf_show_best}
+rf_top %>%
+  kable(digits=3) %>%
+  kable_styling(full_width = F) %>%
+  add_header_above(header = c("Random Forest - Top Configurations" = 8),
+                   bold = TRUE)
+```
+
+The top performing model is ``mode11`` which contains 43 trees with mtry set to 6.
+
+```{r rf_select_best}
+rf_best
+```
+
+A confusion matrix summarizing our top models predictive performance is shown below.
+
+```{r rf_confusion_matrix}
+rf_confusion %>%
+  kable(digits=0) %>%
+  kable_styling(full_width = F) %>%
+  add_header_above(header = c("Random Forest - Confusion Matrix" = 3),
+                   bold = TRUE)
+```
+
+# Support Vector Machine RBF Kernel
+
+## Model Description
+
+SVM algorithms are able to create nonlinear decision boundaries through use of linear models by making a series of non-linear transformation to the feature space. This process leaves a linear model subject to significant complexity and the potential for overfitting. However, SVMs address these issues by finding the maximum margin hyperplane. The maximum marginal hyperplane is a hyperplane that provides the greatest seperation between classes, allowing for a reduction in making low certainty classification decisions.
+
+### Preprocessing Steps
+
+We will apply the following transformations in our recipe:
+
++ *step_bagimpute* (creates bagged tree models to impute missing data): This step is applied as missing values will result in a loss of predictive performance in our models.
++ *step_zv* (removes of columns with single values): This step is applied as columns with single variables will add no predictive power to our models.
++ *step_corr* (filters out predictors that are highly correlated):  This step is applied to reduce dependencies on background variables.
++ *step_normalize* (normalizes numeric data to have standard deviation of 1 and mean of 0):  This step is applied to scale predictors without distorting values or losing information.
++ *step_BoxCox* (transforms non-normal dependent variables into a normal shape): This step is applied to reduce skewness in predictors as the tails of the distribution can dominate the underlying calculations for SVMs.
+
+Note that the only transformation applied to out outcome variables is ``step_bagimpute``. We will not consider applying other transformations to our outcome variable as we are working with categorical data. 
+
+## Cross-Validation Results
+
+At this point we have a series of SVM model configurations that have been trained using our k-fold dataset. Below is a chart of our performance metrics show for each model configuration.
+
+From the chart below, we can see that roc_auc start to increase up to an rbf_sigma value of 1e^-5. Roc_auc then decreases significantly at an rbf_sigma value of 1e^-4 and increases thereafter. An interesting observation is that recall begins to drop significantly following rbf_sigma of 1e^-02. This is likely a result of previous rbf_sigma values resulting in the generation of an overfitted model (note the recall value 1 when rbf_sigma is greater than 1e^-02). In general performance with SVMs is shown to be lower than with either our tree based models.
+
+```{r svm_model_assessment}
+load('./data/svm.Rda')
+
+svm_metrics %>%
+  ggplot(aes(x = rbf_sigma, y = mean)) +
+  geom_line() +
+  geom_errorbar(
+    aes(ymin = mean - std_err,
+        ymax = mean + std_err)
+  ) +
+  scale_x_log10() + 
+  facet_wrap(~.metric, scales = 'free_y', ncol = 2) +
+  theme_minimal() + 
+  labs(title = 'Support Vector Machine Performance', 
+       subtitle = 'Tuning RBF Sigma', 
+       x = 'RBF Sigma', y = 'Performance Score')
+```
+
+## Top Configuration
+
+The top 5 configurations are shown below.
+
+```{r svm_show_best}
+svm_top %>%
+  kable(digits=3) %>%
+  kable_styling(full_width = F) %>%
+  add_header_above(header = c("SVM - Top Configurations" = 7),
+                   bold = TRUE)
+```
+
+The top performing model is ``model10`` where rbf_sigma is set to 1.
+
+```{r svm_select_best}
+svm_best
+```
+
+A confusion matrix summarizing our top models predictive performance is shown below.
+
+```{r svm_confusion_matrix}
+svm_confusion %>%
+  kable(digits=0) %>%
+  kable_styling(full_width = F) %>%
+  add_header_above(header = c("SVM - Confusion Matrix" = 3),
+                   bold = TRUE)
+```
+
+# Neural Network
+
+## Model Description
+
+Neural networks utilize a series of algorithms to analyze data and make predictions through a process similar to how the human brain operates. Neural networks mimic this process by creating a system or neurons that exist in hidden layers. Each layer takes a combination of inputs with varying weights and produces a set of outputs. The set of outputs will then feed into subsequent hidden layers (with new weights applied). Outputs from the final hidden layer will then be used to determine the final prediction of the model, which is given in the output layer. In this report we will be working with multilayer perceptron (MLP) networks. MLP networks takes advantage of backpropagation which is a supervised learning technique for training the network. In these networks, nodes in each layer are fully connected to nodes in the subsequent layer.
+
+### Preprocessing Steps
+
+We will apply the following transformations in our recipe:
+
++ *step_bagimpute* (creates bagged tree models to impute missing data): This step is applied as missing values will result in a loss of predictive performance in our models.
++ *step_zv* (removes of columns with single values): This step is applied as columns with single variables will add no predictive power to our models.
++ *step_corr* (filters out predictors that are highly correlated):  This step is applied to reduce dependencies on background variables.
++ *step_normalize* (normalizes numeric data to have standard deviation of 1 and mean of 0):  This step is applied to scale predictors without distorting values or losing information.
++ *step_BoxCox* (transforms non-normal dependent variables into a normal shape): This step is applied to reduce skewness in predictors as the tails of the distribution can dominate the underlying calculations for neural nets.
+
+Note that the only transformation applied to out outcome variables is ``step_bagimpute``. We will not consider applying other transformations to our outcome variable as we are working with categorical data.  
+
+## Cross-Validation Results
+
+At this point we have a series of neural net model configurations that have been trained using our k-fold dataset. Below is a chart of our performance metrics show for each model configuration.
+
+From the chart below, we can see that performance across all metrics has a tendency to increase as the number of hidden layers increases. Performance based on roc_auc is maximized with 8 hidden layers. We can see that recall is maximized with 2 hidden layers. This is likely a result of models with fewer hidden layers being overfitted to some degree, resulting in increased probability of predicting up movements as opposed to down movements. In general performance with neural nets is shown to be lower than with either our tree based models.
+
+```{r nn_model_assessment}
+load('./data/nn.Rda')
+
+nn_metrics %>%
+  ggplot(aes(x = hidden_units, y = mean)) +
+  geom_line() +
+  geom_errorbar(
+    aes(ymin = mean - std_err,
+        ymax = mean + std_err)
+  ) +
+  facet_wrap(~.metric, scales = 'free_y', ncol = 2) +
+  theme_minimal() + 
+  labs(title = 'Neural Nets Performance', 
+       subtitle = 'Tuning Hidden Units', 
+       x = 'Hidden Units', y = 'Performance Score')
+```
+
+## Top Configuration
+
+### Selection of Best Model
+
+The top configurations are shown below.
+
+```{r nn_show_best}
+nn_top %>%
+  kable(digits=3) %>%
+  kable_styling(full_width = F) %>%
+  add_header_above(header = c("Neural Net- Top Configurations" = 7),
+                   bold = TRUE)
+```
+
+The top performing model is ``model08`` where the number of hidden layers is set to 8.
+
+```{r nn_select_best}
+nn_best
+```
+
+A confusion matrix summarizing our top models predictive performance is shown below.
+
+```{r nn_confusion_matrix}
+nn_confusion %>%
+  kable(digits=3) %>%
+  kable_styling(full_width = F) %>%
+  add_header_above(header = c("Neural Net - Confusion Matrix" = 3),
+                   bold = TRUE)
+```
+
+# Model Selection and Test Performance
+
+## Summary of Performance Metrics For Top Model Configerations
+
+A summary of the performance metrics for each of our top performing models is show below. Overall, our top preforming model is our boosting model with 100 trees.
+
+```{r top_models}
+top_models <- boost_metrics %>%
+  filter(.config == boost_best$.config) %>%
+  select(-n, -.estimator) %>%
+  mutate(model = "Boosting", .before = trees,
+         param_1 = "trees",
+         param_1_val = trees,
+         param_2 = NA,
+         param_2_val = NA) %>%
+  select(-trees) %>%
+  union(
+    rf_metrics %>%
+    filter(.config == rf_best$.config) %>%
+    select(-n, -.estimator) %>%
+    mutate(model = "Random Forest", .before = mtry,
+           param_1 = "mtry",
+           param_1_val = mtry,
+           param_2 = "trees",
+           param_2_val = trees) %>%
+    select(-mtry, -trees)
+  ) %>%
+  union(
+    svm_metrics %>%
+      filter(.config == svm_best$.config) %>%
+      select(-n, -.estimator) %>%
+      mutate(model = "SVM", .before = rbf_sigma,
+            param_1 = "rbf_sigma",
+            param_1_val = rbf_sigma,
+            param_2 = NA,
+            param_2_val = NA) %>%
+      select(-rbf_sigma)
+  ) %>%
+  union(
+    nn_metrics %>%
+    filter(.config == nn_best$.config) %>%
+    select(-n, -.estimator) %>%
+    mutate(model = "Neural Net", .before = hidden_units,
+           param_1 = "hidden_units",
+           param_1_val = hidden_units,
+           param_2 = NA,
+           param_2_val = NA) %>%
+    select(-hidden_units)
+  ) %>%
+  dcast(.config +
+        model +
+        param_1 +
+        param_1_val +
+        param_2 +
+        param_2_val ~
+          .metric,
+          value.var = "mean"
+        )
+
+top_models %>%
+  kable(digits=3) %>%
+  kable_styling(full_width = F) %>%
+  add_header_above(header = c("Performance Metrics - Training" = 12),
+                   bold = TRUE)
+```
+
+## Finalizing the Workflow
+
+We will now use our boosting model to finalize our workflow. We will then be able to fit the model on our training dataset.
+
+```{r finalize_workflow}
+best_class <- top_models[which.max(top_models$roc_auc),]$model
+
+best_model <-
+  if(best_class == "Boosting") {
+    boost_best
+  } else if (best_class == "Random Forest") {
+    rf_best
+  } else if (best_class == "SVM") {
+    svm_best
+  } else if (best_class == "Neural Net") {
+    nn_best
+  }
+
+best_wf <-
+  if(best_class == "Boosting") {
+    boost_wf
+  } else if (best_class == "Random Forest") {
+    rf_wf
+  } else if (best_class == "SVM") {
+    svm_wf
+  } else if (best_class == "Neural Net") {
+    nn_wf
+  }
+
+wf_final <-
+   best_wf %>%
+   finalize_workflow(best_model)
+ 
+ final_fit <- wf_final %>%
+   fit(data = train_dt)
+```
+
+## Testing Performance Metrics
+
+We will now use our finalized model to predict values in our testing dataset and generate a list of performance metrics.
+
+```{r test_performance}
+test_dt_final <- test_dt %>%
+  bind_cols(
+    predict(final_fit, test_dt),
+    predict(final_fit, test_dt, type='prob')
+  )
+
+test_metrics_final <- test_dt_final %>%
+  perf_meas(truth=Direction, estimate=.pred_class, .pred_Up) %>%
+  select(-.estimator) %>%
+  mutate(model = best_class, 
+         .config = best_model$.config,
+         .before = .metric)
+
+test_metrics_final %>%
+  kable(digits=3) %>%
+  kable_styling(full_width = F) %>%
+  add_header_above(header = c("Performance Metrics - Testing" = 4),
+                   bold = TRUE)
+```
+
+In comparison of our performance metrics on our training and testing sets we can see that similar results have been achieved. Given the stochastic (random) movements in the market, this is a strong indication that the model is moderately robust, however this assumption should be validated by testing the model on a larger dataset with more observations. 
+
+# Conclusion
+
+In conclusion we determine that the our boosting model with 100 trees is the most optimal model contained in this report for predicting up/down movements in the S&P500. Overall, this model has achieve an roc_auc score of ``0.548`` and ``0.556`` on training and testing sets respectively. Additionally, this model achieved accuracy scores of ``0.547`` and ``0.543`` on training and testing sets respectively. 
+
+While our boosting model is identified as our overall best model, we still recognize that the performance of our model is quite poor. We attribute the poor performance to stochastic movements in the market, which significantly limit the power of our models to make accurate predictions. For further improvements we recommend including a predictor to measure market sentiment based on various news sources, as this would greatly enhance our models performance.

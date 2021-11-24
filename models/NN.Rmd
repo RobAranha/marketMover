@@ -1,0 +1,243 @@
+---
+title: "marketMover"
+subtitle: "Prediction of Up/Down Movements in the S&P500 (Neural Networks)"
+author: "Robert Aranha"
+date: "August 2021"
+output: 
+  html_document:
+    toc: True
+    toc_float: True
+    theme: cosmo
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Load Libraries
+
+```{r load libraries}
+library(tidyverse)
+library(tidymodels)
+library(ISLR)
+library(knitr)
+library(GGally)
+library(doParallel)
+library(glmnet)
+library(reshape2)
+library(kableExtra)
+library(xgboost)
+library(ranger)
+library(kernlab)
+library(rlist)
+```
+
+## Load Data
+
+```{r load data}
+# Documentation for data available here:
+# https://www.rdocumentation.org/packages/ISLR/versions/1.2/topics/Smarket
+data(Smarket)
+market_dt <- Smarket %>%
+  as_tibble() %>%
+  select(-Today) %>%
+  mutate(Direction = fct_relevel(Direction, 'Up'))
+
+market_dt <- market_dt %>%
+  mutate(cc_Lag1 = log(1 + Lag1/100),
+         cc_avg = cummean(cc_Lag1),
+         cc_over_avg = cc_Lag1 > cc_avg,
+         cc_avg_diff = cc_Lag1 - cc_avg)
+ 
+vals <- list()
+ 
+for (row in 2:nrow(market_dt)) {
+  cur_cc_over_avg <- market_dt[row, "cc_over_avg"]
+  prev_cc_over_avg <- market_dt[row - 1, "cc_over_avg"]
+  
+  if (row == 2){
+   if (prev_cc_over_avg == TRUE) {
+     vals <- list.append(1)
+   } else if (prev_cc_over_avg == FALSE) {
+     vals <- list.append(-1)
+   }
+  }
+  
+  if(cur_cc_over_avg == TRUE && prev_cc_over_avg == TRUE){
+   vals <- list.append(vals, 1 + vals[row - 1])
+  } else if (cur_cc_over_avg == TRUE && prev_cc_over_avg == FALSE){
+   vals <- list.append(vals, 1)   
+  } else if (cur_cc_over_avg == FALSE && prev_cc_over_avg == TRUE){
+   vals <- list.append(vals, -1)   
+  } else if (cur_cc_over_avg == FALSE && prev_cc_over_avg == FALSE){
+   vals <- list.append(vals, vals[row - 1] - 1)   
+  }
+}
+
+market_dt$days_over_avg = vals
+```
+
+## Split Data
+
+```{r split_data}
+set.seed(123)
+market_split <- initial_split(market_dt, prop=0.7, strata=Direction)
+train_dt <- training(market_split)
+test_dt <- testing(market_split)
+
+set.seed(456)
+folds_dt <- train_dt %>%
+  vfold_cv(v=5, repeats=5, strata=Direction)
+```
+
+## Define Performance Metrics
+
+```{r build_metric_set}
+perf_meas <- metric_set(roc_auc, precision, recall, accuracy, f_meas, kap)
+```
+
+### Define Recipe
+
+We now define the recipe for our neural network models. We will attempt to predict direction based on Volume, Year, cc_avg_diff, and days_over_avg. We will opt not to include time lags as a variable in our predictions for the rational stated in the EDA section.
+
+We will apply the following transformations in our recipe:
+
++ *step_bagimpute* (creates bagged tree models to impute missing data): This step is applied as missing values will result in a loss of predictive performance in our models.
++ *step_zv* (removes of columns with single values): This step is applied as columns with single variables will add no predictive power to our models.
++ *step_corr* (filters out predictors that are highly correlated):  This step is applied to reduce dependencies on background variables.
++ *step_normalize* (normalizes numeric data to have standard deviation of 1 and mean of 0):  This step is applied to scale predictors without distorting values or losing information.
++ *step_BoxCox* (transforms non-normal dependent variables into a normal shape): This step is applied to reduce skewness in predictors as the tails of the distribution can dominate the underlying calculations for neural nets.
+
+Note that the only transformation applied to out outcome variables is ``step_bagimpute``. We will not consider applying other transformations to our outcome variable as we are working with categorical data.  
+
+```{r nn_recipe}
+nn_rec <- 
+  recipe(Direction ~ Volume + Year + days_over_avg + cc_avg_diff, data=train_dt) %>%
+  step_mutate(direction_na = ifelse(is.na(Direction), 1, 0), skip = TRUE)%>%
+  step_bagimpute(Direction, Volume) %>%
+  step_zv(all_predictors(), -all_outcomes()) %>%
+  step_corr(all_predictors(), -all_outcomes()) %>%
+  step_normalize(all_predictors(), -all_outcomes()) %>%
+  step_BoxCox(all_predictors(), -all_outcomes())
+```
+
+### Define the Model
+
+Our model will use the nnet engine and will be set to classification mode. We will indicate that we want to tune hidden_units as a hyperparameters. Note that hidden_units refers to the number of hidden layers contained in our model (i.e., the number of layers excluding the input and output layer).
+
+```{r nn_model}
+nn_mod <- 
+  mlp(hidden_units = tune(), epochs = 50) %>%
+  set_mode('classification') %>%
+  set_engine('nnet')
+```
+
+## Hyperparameters
+
+We then create a grid of hyperparameters related to the number of hidden layers to be contained in our model.
+
+```{r nn_tune_hyperparameters}
+nn_grid <- grid_regular(hidden_units(), levels = 10)
+```
+
+### Define Workflow
+
+We then define the workflow, adding our neural net model and our recipe.
+
+```{r nn_workflow}
+nn_wf <- 
+  workflow() %>%
+  add_recipe(nn_rec) %>%
+  add_model(nn_mod)
+```
+
+### Tune Grid
+
+We then tune our model using our grid of hyperparameters.
+
+```{r}
+all_cores <- parallel::detectCores(logical = FALSE)
+cl <- makePSOCKcluster(all_cores)
+registerDoParallel(cl)
+```
+
+```{r nn_tune_grid}
+tune_ctrl <- control_resamples(save_pred = TRUE)
+
+nn_res <-
+  nn_wf %>%
+  tune_grid(
+    folds_dt, 
+    grid = nn_grid,
+    metrics = perf_meas, 
+    control = tune_ctrl
+  )
+```
+
+```{r}
+stopCluster(cl)
+```
+
+## Cross-Validation Results
+
+At this point we have a series of model configurations that have been trained using our k-fold dataset. Below is a chart of our performance metrics show for each model configuration.
+
+```{r nn_model_assessment}
+nn_res %>%
+  collect_metrics() %>%
+  ggplot(aes(x = hidden_units, y = mean)) +
+  geom_line() +
+  geom_errorbar(
+    aes(ymin = mean - std_err,
+        ymax = mean + std_err)
+  ) +
+  facet_wrap(~.metric, scales = 'free_y', ncol = 2) +
+  theme_minimal() + 
+  labs(title = 'Neural Nets Performance', 
+       subtitle = 'Tuning Hidden Units', 
+       x = 'Hidden Units', y = 'Performance Score')
+```
+
+## Top Configuration
+
+### Selection of Best Model
+
+On the basis of roc_auc the top performing model is ``model08`` where the number of hidden layers is set to 8.
+
+```{r nn_show_best}
+nn_top <- nn_res %>%
+  show_best(metric = 'roc_auc')
+
+nn_top
+```
+
+```{r nn_select_best}
+nn_best <- 
+  nn_res %>%
+  select_best(metric = 'roc_auc')
+```
+
+A confusion matrix summarizing our top models predictive performance is shown below.
+
+```{r nn_confusion_matrix}
+nn_confusion <-
+  nn_res %>%
+  conf_mat_resampled(parameters = nn_best)
+
+nn_confusion
+```
+
+### Store Results
+
+For future reference we will store the results from this section of our analysis in an external file.
+
+```{r collect_nn_metrics}
+nn_metrics <-
+  nn_res %>%
+  collect_metrics()
+```
+
+```{r nn_save_results}
+save(nn_wf, nn_metrics, nn_confusion, nn_best, nn_top,
+     file = '../data/nn.Rda')
+```
