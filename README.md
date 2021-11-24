@@ -4,6 +4,8 @@ This report leverages various machine learning models (decision trees, random fo
 The explanatory variables used for predictions are limited to daily trading volume as well as simple market returns over the past 5 trading days.
 The data used in this report was sourced from the ISLR package in R and contains daily market observations from 2001-2005.
 
+The full version of this report can be downloaded by clicking [here](https://github.com/RobAranha/marketMover/raw/main/marketMover.zip).  
+
 ## Performance Metrics (Training)
 
 Performance metrics for each of our top model configurations are shown below.
